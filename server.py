@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible API server for Quark on a single GPU.
-
-One process, one GPU, a small batched engine: requests are gathered for 20 ms,
-clustered by budget and prompt length, and decoded as one padded batch.
-"""
+"""OpenAI-compatible API server for empero-ai/Quark-150M-128K-Zero."""
 import asyncio
 import json
 import os
 import secrets
 import queue
+import signal
 import threading
 import time
 import uuid
 
 import torch
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -28,9 +24,15 @@ MODEL_NAME = os.environ.get("MODEL_NAME", MODEL_ID.split("/")[-1])
 MODEL_ALIAS = os.environ.get("MODEL_ALIAS", MODEL_ID)
 MAX_CONTEXT = int(os.environ.get("MAX_CONTEXT", "131072"))
 MAX_OUTPUT = int(os.environ.get("MAX_OUTPUT", "65536"))
+MAX_DEFAULT_OUTPUT = int(os.environ.get("MAX_DEFAULT_OUTPUT", "1024"))
+MAX_BODY_BYTES = int(float(os.environ.get("MAX_BODY_MB", "8")) * 1024 * 1024)
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "64"))
+PER_IP_MAX = int(os.environ.get("PER_IP_MAX", "24"))
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+RATE_BURST = int(os.environ.get("RATE_BURST", "20"))
+DRAIN_GRACE = float(os.environ.get("DRAIN_GRACE", "20"))
 KV_BYTES_PER_TOKEN = 8192  # 4 global layers x 4 KV heads x 64 dim x 2 (K,V) x 4 bytes
-KV_BUDGET_BYTES = int(float(os.environ.get("KV_BUDGET_GB", "80")) * 1e9)
+KV_BUDGET_BYTES = int(float(os.environ.get("KV_BUDGET_GB", "48")) * 1e9)
 TOKEN_PATH = os.environ.get("TOKEN_PATH", os.path.join(ROOT, "token.txt"))
 if os.path.exists(TOKEN_PATH):
     TOKEN = open(TOKEN_PATH, "r", encoding="utf-8").read().strip()
@@ -46,6 +48,10 @@ active = 0
 kv_reserved = 0
 active_lock = threading.Lock()
 stats = {"requests": 0, "rejected": 0, "prompt_tokens": 0, "completion_tokens": 0}
+per_ip_active = {}          # client -> requests in flight
+per_ip_bucket = {}          # client -> [tokens, last_refill]
+drain_deadline = [None]     # set on SIGTERM: finish in-flight, then stop
+
 
 app = FastAPI(title=MODEL_NAME, version="1.0", docs_url=None, redoc_url=None, openapi_url=None)
 tok = None
@@ -55,13 +61,16 @@ model = None
 # ---------------------------------------------------------------- streaming
 # --------------------------------------------------------------- batch engine
 MAX_BATCH = int(os.environ.get("MAX_BATCH", str(MAX_CONCURRENT)))
-EOS_IDS = None
+# a batch is capped by tokens as well as rows: 64 sessions at 128k would otherwise
+# try to prefill ~8M tokens in one pass and run the GPU out of memory
+MAX_BATCH_TOKENS = int(float(os.environ.get("MAX_BATCH_TOKENS", "262144")))
 
 
 class Job:
     """One in-flight generation, fed by the engine thread."""
 
-    __slots__ = ("prompt_ids", "budget", "temperature", "top_p", "loop", "queue", "parts", "count")
+    __slots__ = ("prompt_ids", "budget", "temperature", "top_p", "loop", "queue", "parts",
+                 "count", "aborted", "reserve", "settled", "client", "truncated")
 
     def __init__(self, prompt_ids, budget, temperature, top_p, loop):
         self.prompt_ids = prompt_ids
@@ -72,15 +81,22 @@ class Job:
         self.queue = asyncio.Queue()
         self.parts = []
         self.count = 0
+        self.aborted = False
+        self.reserve = 0
+        self.settled = False
+        self.client = None
+        self.truncated = False
 
     def emit(self, text):
         self.parts.append(text)
         self.loop.call_soon_threadsafe(self.queue.put_nowait, ("delta", text))
 
     def finish(self):
+        settle(self)
         self.loop.call_soon_threadsafe(self.queue.put_nowait, ("done", None))
 
     def fail(self, message):
+        settle(self)
         self.loop.call_soon_threadsafe(self.queue.put_nowait, ("error", message))
 
 
@@ -128,7 +144,6 @@ class BatchedStreamer(BaseStreamer):
         self.next_tokens_are_prompt = True
         self.pending = [[] for _ in jobs]
         self.done = [False] * len(jobs)
-        self.count = [0] * len(jobs)
 
     def _flush(self, i):
         if self.pending[i]:
@@ -150,9 +165,9 @@ class BatchedStreamer(BaseStreamer):
                 self.done[i] = True
                 self._flush(i)
                 continue
-            self.count[i] += 1
+            job.count += 1
             self.pending[i].append(token)
-            if self.count[i] >= job.budget:
+            if job.count >= job.budget:
                 self.done[i] = True
                 self._flush(i)
                 continue
@@ -166,35 +181,71 @@ class BatchedStreamer(BaseStreamer):
     def end(self):
         for i in range(len(self.jobs)):
             self._flush(i)
-            self.jobs[i].count = self.count[i]
 
 
 pending_jobs = queue.Queue()
 
 
+engine_state = {"beat": time.time(), "error": None, "fails": 0, "last_ok": time.time()}
+
+
 def engine_loop():
+    """One thread, one GPU: gather jobs, decode a slice, requeue the unfinished.
+
+    Never allowed to die: a failure is recorded, the jobs in hand are failed, and the
+    loop keeps beating so /health can tell a stuck engine from a healthy one.
+    """
     while True:
-        first = pending_jobs.get()
-        jobs = [first]
-        deadline = time.time() + 0.02
-        while len(jobs) < MAX_BATCH:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            try:
-                jobs.append(pending_jobs.get(timeout=remaining))
-            except queue.Empty:
-                break
-        # cluster similar budgets and prompt lengths so padding waste stays small
-        jobs.sort(key=lambda j: (j.budget // 256, int(j.prompt_ids.shape[1]) // 512))
+        jobs = []
         try:
+            try:
+                first = pending_jobs.get(timeout=5)
+            except queue.Empty:
+                continue
+            jobs = [first]
+            deadline = time.time() + 0.02
+            while len(jobs) < MAX_BATCH:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    jobs.append(pending_jobs.get(timeout=remaining))
+                except queue.Empty:
+                    break
+            # cluster similar budgets and prompt lengths so padding waste stays small
+            jobs.sort(key=lambda j: (j.budget // 256, int(j.prompt_ids.shape[1]) // 512))
+            # then keep the batch inside the token budget; the rest go back in the queue
+            kept, used = [], 0
+            for job in jobs:
+                cost = int(job.prompt_ids.shape[1]) + job.count
+                if kept and used + cost > MAX_BATCH_TOKENS:
+                    pending_jobs.put(job)
+                    continue
+                kept.append(job)
+                used += cost
+            jobs = kept
             run_batch(jobs)
+            engine_state["fails"] = 0
+            engine_state["error"] = None
+            engine_state["last_ok"] = time.time()
         except Exception as exc:
+            engine_state["error"] = "%s: %s" % (type(exc).__name__, exc)
+            engine_state["fails"] = engine_state.get("fails", 0) + 1
+            if "out of memory" in str(exc).lower():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             for job in jobs:
                 job.fail(str(exc))
+        finally:
+            engine_state["beat"] = time.time()
 
 
 def run_batch(jobs):
+    jobs = [j for j in jobs if not j.aborted]
+    if not jobs:
+        return
     width = max(int(j.prompt_ids.shape[1]) for j in jobs)
     rows = len(jobs)
     input_ids = torch.full((rows, width), tok.pad_token_id, dtype=torch.long)
@@ -203,12 +254,22 @@ def run_batch(jobs):
         n = int(job.prompt_ids.shape[1])
         input_ids[i, width - n:] = job.prompt_ids[0]
         attention[i, width - n:] = 1
+
+    # keep the longest single slice short so nobody waits behind a marathon;
+    # scale it with context so re-prefill overhead stays small
+    slice_tokens = max(64, min(2048, width // 40))
+    step = min(slice_tokens, max(j.budget - j.count for j in jobs))
+    if step < 1:
+        for job in jobs:
+            job.finish()
+        return
+
     streamer = BatchedStreamer(jobs, tok, model.generation_config.eos_token_id)
     with torch.inference_mode():
-        model.generate(
+        out = model.generate(
             input_ids=input_ids.to("cuda"),
             attention_mask=attention.to("cuda"),
-            max_new_tokens=max(j.budget for j in jobs),
+            max_new_tokens=step,
             do_sample=True,
             logits_processor=[PerRowSampler([j.temperature for j in jobs], [j.top_p for j in jobs])],
             eos_token_id=model.generation_config.eos_token_id,
@@ -216,16 +277,28 @@ def run_batch(jobs):
             streamer=streamer,
         )
     streamer.end()
-    for job in jobs:
-        job.finish()
+
+    deadline = drain_deadline[0]
+    past_grace = deadline is not None and time.time() > deadline
+    for i, job in enumerate(jobs):
+        produced = out[i, width:]
+        if produced.numel():
+            job.prompt_ids = torch.cat([job.prompt_ids, produced.unsqueeze(0).cpu()], dim=1)
+        if streamer.done[i] or job.count >= job.budget or job.aborted or past_grace:
+            if past_grace and job.count < job.budget:
+                job.truncated = True   # cut short by shutdown, not by the model
+            job.finish()
+        else:
+            pending_jobs.put(job)   # back in the queue: others get a turn
 
 
-def submit(prompt_ids, budget, body, loop):
+def submit(prompt_ids, budget, body, loop, reserve=0):
     temperature = body.get("temperature")
     temperature = 1.0 if temperature is None else float(temperature)
     top_p = body.get("top_p")
     top_p = 0.95 if top_p is None else float(top_p)
     job = Job(prompt_ids, budget, temperature, min(max(top_p, 1e-4), 1.0), loop)
+    job.reserve = reserve
     pending_jobs.put(job)
     return job
 
@@ -255,6 +328,15 @@ def err(status, message, etype="invalid_request_error", code=None, param=None):
 
 
 def overloaded(reason="slots"):
+    if reason == "client":
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": "2"},
+            content={"error": {
+                "message": "This client already has %d requests in flight (per-client limit). Retry shortly."
+                           % PER_IP_MAX,
+                "type": "overloaded_error", "param": None, "code": "client_concurrency_limit"}},
+        )
     if reason == "memory":
         message = ("Server KV-cache budget is full (%.0f GB reserved of %.0f GB). Retry shortly."
                    % (kv_reserved / 1e9, KV_BUDGET_BYTES / 1e9))
@@ -296,18 +378,49 @@ def check_auth(request: Request):
     )
 
 
-def acquire(reserve_bytes=0):
+def client_of(request: Request):
+    """The real caller behind cloudflared, for rate limiting."""
+    for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        value = request.headers.get(header)
+        if value:
+            return value.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def rate_ok(client):
+    """Token bucket per client: RATE_LIMIT_RPM sustained, RATE_BURST at once."""
+    now = time.time()
+    with active_lock:
+        bucket = per_ip_bucket.get(client)
+        if bucket is None:
+            bucket = [float(RATE_BURST), now]
+            per_ip_bucket[client] = bucket
+        else:
+            bucket[0] = min(float(RATE_BURST), bucket[0] + (now - bucket[1]) * RATE_LIMIT_RPM / 60.0)
+            bucket[1] = now
+        if bucket[0] < 1.0:
+            return False
+        bucket[0] -= 1.0
+        return True
+
+
+def acquire(reserve_bytes=0, client=None):
     global active, kv_reserved
     with active_lock:
         if kv_reserved + reserve_bytes > KV_BUDGET_BYTES:
             stats["rejected"] += 1
             return "memory"
+        if client is not None and per_ip_active.get(client, 0) >= PER_IP_MAX:
+            stats["rejected"] += 1
+            return "client"
     if not slots.acquire(blocking=False):
         stats["rejected"] += 1
         return "slots"
     with active_lock:
         active += 1
         kv_reserved += reserve_bytes
+        if client is not None:
+            per_ip_active[client] = per_ip_active.get(client, 0) + 1
     stats["requests"] += 1
     return None
 
@@ -318,6 +431,33 @@ def release(reserve_bytes=0):
         active = max(0, active - 1)
         kv_reserved = max(0, kv_reserved - reserve_bytes)
     slots.release()
+
+
+def settle(job):
+    """Give back a job's slot and reservation exactly once.
+
+    Whoever gets here first wins: the handler when the client goes away, or the engine
+    when the work actually finishes. A disconnected client therefore cannot leak a slot,
+    and a job that is still decoding keeps its reservation counted against the budget.
+    """
+    global active, kv_reserved
+    with active_lock:
+        if job.settled:
+            return
+        job.settled = True
+        active = max(0, active - 1)
+        kv_reserved = max(0, kv_reserved - job.reserve)
+        if job.client is not None and per_ip_active.get(job.client):
+            per_ip_active[job.client] -= 1
+            if per_ip_active[job.client] <= 0:
+                per_ip_active.pop(job.client, None)
+    slots.release()
+
+
+def bump(prompt_tokens, completion_tokens):
+    with active_lock:
+        stats["prompt_tokens"] += prompt_tokens
+        stats["completion_tokens"] += completion_tokens
 
 
 def messages_from_chat(body):
@@ -409,17 +549,35 @@ def budget_for(body, prompt_len, max_field_names):
         return None, (
             "Prompt is %d tokens, over the %d-token context limit." % (prompt_len, MAX_CONTEXT)
         )
-    budget = min(requested or MAX_OUTPUT, room, MAX_OUTPUT)
+    budget = min(requested or MAX_DEFAULT_OUTPUT, room, MAX_OUTPUT)
     return budget, None
 
 
 # ------------------------------------------------------------------ endpoints
+def install_signal_handlers():
+    """On SIGTERM keep serving what is in flight for DRAIN_GRACE seconds, then wind up.
+
+    uvicorn's own handler waits for in-flight work with no deadline, which is how a
+    wedged request once kept a stopping process alive holding 11 GB of GPU memory.
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def handler(signum, frame):
+        drain_deadline[0] = time.time() + DRAIN_GRACE
+        print("SIGTERM: draining in-flight requests for %.0fs" % DRAIN_GRACE, flush=True)
+        if callable(previous):
+            previous(signum, frame)
+
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError) as exc:
+        print("could not install SIGTERM handler: %s" % exc, flush=True)
+
+
 @app.on_event("startup")
 def load_model():
+    install_signal_handlers()
     global tok, model
-    asyncio.get_running_loop().set_default_executor(
-        ThreadPoolExecutor(max_workers=MAX_CONCURRENT + 8, thread_name_prefix="gen")
-    )
     source = MODEL_DIR if os.path.isdir(MODEL_DIR) else MODEL_ID
     if source == MODEL_ID:
         print("model not found in %s, downloading %s" % (MODEL_DIR, MODEL_ID), flush=True)
@@ -434,10 +592,32 @@ def load_model():
     print("model loaded:", MODEL_NAME, "batch engine started", flush=True)
 
 
+@app.middleware("http")
+async def limit_body(request: Request, call_next):
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {
+                "message": "Request body is %s bytes, over the %d MB limit."
+                           % (declared, MAX_BODY_BYTES // 1024 // 1024),
+                "type": "invalid_request_error", "param": None, "code": "request_too_large"}},
+        )
+    return await call_next(request)
+
+
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
+    beat_age = time.time() - engine_state["beat"]
+    # three failed batches in a row means the GPU is in a bad state (an OOM that keeps
+    # recurring): requests are failing while the process looks fine, so say so loudly
+    engine_ok = beat_age < 30 and engine_state.get("fails", 0) < 3
+    payload = {
+        "status": "ok" if engine_ok else "degraded",
+        "engine_alive": engine_ok,
+        "engine_beat_age_s": round(beat_age, 1),
+        "engine_last_error": engine_state["error"],
+        "engine_consecutive_failures": engine_state.get("fails", 0),
         "model": MODEL_NAME,
         "max_context": MAX_CONTEXT,
         "max_output": MAX_OUTPUT,
@@ -446,8 +626,10 @@ def health():
         "kv_reserved_gb": round(kv_reserved / 1e9, 2),
         "kv_budget_gb": round(KV_BUDGET_BYTES / 1e9, 1),
         "max_batch": MAX_BATCH,
+        "max_body_mb": round(MAX_BODY_BYTES / 1024 / 1024, 1),
         "uptime_s": round(time.time() - STARTED, 1),
     }
+    return JSONResponse(status_code=200 if engine_ok else 503, content=payload)
 
 
 @app.get("/v1/models")
@@ -462,6 +644,7 @@ def list_models(request: Request):
         "owned_by": "empero-ai",
         "context_length": MAX_CONTEXT,
         "max_output_tokens": MAX_OUTPUT,
+        "default_output_tokens": MAX_DEFAULT_OUTPUT,
         "max_completion_tokens": MAX_OUTPUT,
         "per_request_context_limit": MAX_CONTEXT,
         "capabilities": {
@@ -521,8 +704,15 @@ async def chat_completions(request: Request):
     if problem:
         return err(400, problem, code="context_length_exceeded")
 
+    client = client_of(request)
+    if not rate_ok(client):
+        return JSONResponse(status_code=429, headers={"Retry-After": "5"},
+                            content={"error": {
+                                "message": "Rate limit: %d requests per minute per client. Retry shortly."
+                                           % RATE_LIMIT_RPM,
+                                "type": "rate_limit_error", "param": None, "code": "rate_limit_exceeded"}})
     reserve = (prompt_len + budget) * KV_BYTES_PER_TOKEN
-    reason = acquire(reserve)
+    reason = acquire(reserve, client)
     if reason:
         return overloaded(reason)
 
@@ -532,14 +722,16 @@ async def chat_completions(request: Request):
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
     if not streaming:
+        job = submit(prompt_ids, budget, body, asyncio.get_running_loop(), reserve)
+        job.client = client
         try:
-            text, completion = await job_collect(submit(prompt_ids, budget, body, asyncio.get_running_loop()))
+            text, completion = await job_collect(job)
         except Exception as exc:
-            release(reserve)
             return err(500, "Generation failed: %s" % exc, etype="server_error")
-        release(reserve)
-        stats["prompt_tokens"] += prompt_len
-        stats["completion_tokens"] += completion
+        finally:
+            job.aborted = True
+            settle(job)
+        bump(prompt_len, completion)
         return {
             "id": cid,
             "object": "chat.completion",
@@ -551,7 +743,7 @@ async def chat_completions(request: Request):
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
                     "logprobs": None,
-                    "finish_reason": "stop",
+                    "finish_reason": "length" if job.truncated else "stop",
                 }
             ],
             "usage": {
@@ -561,7 +753,8 @@ async def chat_completions(request: Request):
             },
         }
 
-    job = submit(prompt_ids, budget, body, asyncio.get_running_loop())
+    job = submit(prompt_ids, budget, body, asyncio.get_running_loop(), reserve)
+    job.client = client
 
     async def events():
         try:
@@ -590,12 +783,12 @@ async def chat_completions(request: Request):
                 "created": created,
                 "model": body.get("model") or MODEL_NAME,
                 "system_fingerprint": None,
-                "choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "logprobs": None,
+                             "finish_reason": "length" if job.truncated else "stop"}],
             }
             yield "data: " + json.dumps(tail) + "\n\n"
             if include_usage:
-                stats["prompt_tokens"] += prompt_len
-                stats["completion_tokens"] += job.count
+                bump(prompt_len, job.count)
                 yield "data: " + json.dumps({
                     "id": cid, "object": "chat.completion.chunk", "created": created,
                     "model": body.get("model") or MODEL_NAME, "choices": [],
@@ -604,7 +797,8 @@ async def chat_completions(request: Request):
                 }) + "\n\n"
             yield "data: [DONE]\n\n"
         finally:
-            release(reserve)
+            job.aborted = True
+            settle(job)
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -634,8 +828,15 @@ async def responses(request: Request):
     if problem:
         return err(400, problem, code="context_length_exceeded")
 
+    client = client_of(request)
+    if not rate_ok(client):
+        return JSONResponse(status_code=429, headers={"Retry-After": "5"},
+                            content={"error": {
+                                "message": "Rate limit: %d requests per minute per client. Retry shortly."
+                                           % RATE_LIMIT_RPM,
+                                "type": "rate_limit_error", "param": None, "code": "rate_limit_exceeded"}})
     reserve = (prompt_len + budget) * KV_BYTES_PER_TOKEN
-    reason = acquire(reserve)
+    reason = acquire(reserve, client)
     if reason:
         return overloaded(reason)
 
@@ -686,17 +887,20 @@ async def responses(request: Request):
         }
 
     if not streaming:
+        job = submit(prompt_ids, budget, body, asyncio.get_running_loop(), reserve)
+        job.client = client
         try:
-            text, completion = await job_collect(submit(prompt_ids, budget, body, asyncio.get_running_loop()))
+            text, completion = await job_collect(job)
         except Exception as exc:
-            release(reserve)
             return err(500, "Generation failed: %s" % exc, etype="server_error")
-        release(reserve)
-        stats["prompt_tokens"] += prompt_len
-        stats["completion_tokens"] += completion
+        finally:
+            job.aborted = True
+            settle(job)
+        bump(prompt_len, completion)
         return envelope("completed", [message_item(text)], text, completion)
 
-    job = submit(prompt_ids, budget, body, asyncio.get_running_loop())
+    job = submit(prompt_ids, budget, body, asyncio.get_running_loop(), reserve)
+    job.client = client
     seq = [0]
 
     def event(name, payload):
@@ -734,14 +938,14 @@ async def responses(request: Request):
             yield event("response.output_item.done", {
                 "type": "response.output_item.done", "output_index": 0, "item": message_item(text),
             })
-            stats["prompt_tokens"] += prompt_len
-            stats["completion_tokens"] += job.count
+            bump(prompt_len, job.count)
             yield event("response.completed", {
                 "type": "response.completed",
                 "response": envelope("completed", [message_item(text)], text, job.count),
             })
         finally:
-            release(reserve)
+            job.aborted = True
+            settle(job)
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -766,24 +970,34 @@ async def completions(request: Request):
     budget, problem = budget_for(body, prompt_len, ("max_tokens",))
     if problem:
         return err(400, problem, code="context_length_exceeded")
+    client = client_of(request)
+    if not rate_ok(client):
+        return JSONResponse(status_code=429, headers={"Retry-After": "5"},
+                            content={"error": {
+                                "message": "Rate limit: %d requests per minute per client. Retry shortly."
+                                           % RATE_LIMIT_RPM,
+                                "type": "rate_limit_error", "param": None, "code": "rate_limit_exceeded"}})
     reserve = (prompt_len + budget) * KV_BYTES_PER_TOKEN
-    reason = acquire(reserve)
+    reason = acquire(reserve, client)
     if reason:
         return overloaded(reason)
+    job = submit(prompt_ids, budget, body, asyncio.get_running_loop(), reserve)
+    job.client = client
     try:
-        text, completion = await job_collect(submit(prompt_ids, budget, body, asyncio.get_running_loop()))
+        text, completion = await job_collect(job)
     except Exception as exc:
-        release(reserve)
         return err(500, "Generation failed: %s" % exc, etype="server_error")
-    release(reserve)
-    stats["prompt_tokens"] += prompt_len
-    stats["completion_tokens"] += completion
+    finally:
+        job.aborted = True
+        settle(job)
+    bump(prompt_len, completion)
     return {
         "id": "cmpl-" + uuid.uuid4().hex[:24],
         "object": "text_completion",
         "created": int(time.time()),
         "model": body.get("model") or MODEL_NAME,
-        "choices": [{"index": 0, "text": text, "logprobs": None, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "text": text, "logprobs": None,
+                     "finish_reason": "length" if job.truncated else "stop"}],
         "usage": {"prompt_tokens": prompt_len, "completion_tokens": completion,
                   "total_tokens": prompt_len + completion},
     }
